@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Check-in</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  [hidden]{display:none !important}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,Arial,sans-serif;background:#111;color:#fff}
+  .box{padding:14px}
+  input[type=text],input[type=password],input:not([type]){width:100%;padding:12px;margin:6px 0;font-size:16px;border-radius:8px;border:0}
+  button{padding:12px 16px;font-size:16px;border:0;border-radius:8px;background:#1a73e8;color:#fff}
+  .top{display:flex;justify-content:space-between;padding:10px 14px;background:#222;font-size:15px}
+  #stats{font-weight:700}
+  #reader{width:100%;max-width:480px;margin:0 auto;background:#000}
+  #result{margin:10px;padding:16px;border-radius:12px;text-align:center;font-size:18px;min-height:110px}
+  #result .t{font-size:26px;font-weight:800;margin-bottom:6px}
+  .idle{background:#333}.wait{background:#555}
+  .ok{background:#1e8e3e}.dup{background:#d93025}.inv{background:#b31412}
+  .test{background:#1a73e8}.err{background:#e37400}
+  .btnlike{display:block;text-align:center;padding:12px 16px;font-size:16px;border-radius:8px;background:#1a73e8;color:#fff;cursor:pointer}
+  .opt{padding:0 14px;font-size:14px;color:#ccc}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #333}
+  .row button{padding:8px 12px;font-size:14px;white-space:nowrap}
+  #list{margin-top:8px;font-size:15px}
+</style>
+</head>
+<body>
+
+<div id="login" class="box">
+  <h2>🎫 Check-in</h2>
+  <input id="staff" placeholder="Tên nhân viên / cổng (VD: Lan - Cổng 1)">
+  <input id="pin" type="password" inputmode="numeric" placeholder="PIN">
+  <button id="btnStart">Bắt đầu</button>
+  <p style="color:#aaa;font-size:13px">Hãy mở bằng Chrome (Android) hoặc Safari (iPhone), không dùng trình duyệt trong Zalo/Facebook. Cho phép camera khi được hỏi.</p>
+</div>
+
+<div id="app" hidden>
+  <div class="top"><span id="who"></span><span id="stats">–/–</span></div>
+  <div id="reader"></div>
+  <div class="box" style="padding-bottom:0">
+    <label for="fileScan" class="btnlike">📷 Camera không mở được? Bấm để chụp ảnh QR</label>
+    <input type="file" id="fileScan" accept="image/*" capture="environment" hidden>
+    <div id="tmpReader" style="display:none"></div>
+  </div>
+  <div class="opt"><label><input type="checkbox" id="dry"> Chế độ thử quét (KHÔNG ghi check-in)</label></div>
+  <div id="result" class="idle">Sẵn sàng quét</div>
+  <div class="box">
+    <input id="q" placeholder="Không quét được? Tìm tên / công ty / Ticket ID">
+    <button id="btnSearch">Tìm</button>
+    <div id="list"></div>
+  </div>
+</div>
+
+<script>
+/* ====== CẤU HÌNH: dán URL Web App Apps Script (đuôi /exec) vào đây ====== */
+const API_URL = 'https://script.google.com/macros/s/AKfycbyyPlYnBiBvGgoOV1o8HgiJ7yAxRtO21d1z4DkRcS3ZoT5fOM5e3LwQRRNuNWUshfgkWw/exec';
+
+/* Shim: giả lập google.script.run bằng fetch tới Apps Script API */
+const google = { script: { run: (function build(ok, fail) {
+  return new Proxy({}, { get: function (_, name) {
+    if (name === 'withSuccessHandler') return function (f) { return build(f, fail); };
+    if (name === 'withFailureHandler') return function (f) { return build(ok, f); };
+    return function (payload) {
+      fetch(API_URL, { method: 'POST', body: JSON.stringify({ fn: name, p: payload }) })
+        .then(function (r) { return r.json(); })
+        .then(function (res) { if (res && res.__error) throw new Error(res.__error); return res; })
+        .then(function (res) { if (ok) ok(res); }, function (e) { if (fail) fail(e); else console.error(e); });
+    };
+  } });
+})(null, null) } };
+</script>
+<script>
+const $ = id => document.getElementById(id);
+let session = { staff: '', pin: '' };
+let scanner = null, busy = false, lastCode = '', lastAt = 0, audioCtx = null;
+
+try { $('staff').value = localStorage.getItem('staff') || ''; } catch (e) {}
+
+$('btnStart').onclick = () => {
+  const staff = $('staff').value.trim(), pin = $('pin').value.trim();
+  if (!staff || !pin) { alert('Nhập tên và PIN'); return; }
+  session = { staff: staff, pin: pin };
+  try { localStorage.setItem('staff', staff); } catch (e) {}
+  try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  google.script.run
+    .withSuccessHandler(r => {
+      if (r.status === 'AUTH') { alert('Sai PIN'); return; }
+      $('login').hidden = true; $('app').hidden = false;
+      $('who').textContent = staff;
+      updateStats(r.stats);
+      startScanner();
+      setInterval(refreshStats, 20000);
+    })
+    .withFailureHandler(e => alert('Lỗi kết nối: ' + e.message))
+    .apiStats({ pin: pin });
+};
+
+function startScanner() {
+  scanner = new Html5Qrcode('reader', {
+    formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
+    experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+    verbose: false
+  });
+  scanner.start(
+    { facingMode: 'environment' },
+    { fps: 12, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.75); return { width: s, height: s }; } },
+    onScan,
+    () => {}
+  ).catch(err => show('err', '⚠️ Không mở được camera', [String(err), 'Hãy dùng nút "Chụp ảnh QR" ở trên, hoặc cho phép camera cho Chrome/Safari rồi tải lại trang, hoặc dùng ô tìm kiếm bên dưới.']));
+}
+
+/* Quét dự phòng: chụp ảnh bằng app camera của máy, rồi đọc QR trong ảnh */
+$('fileScan').onchange = async (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  show('wait', '⏳ Đang đọc ảnh…', []);
+  try {
+    const tmp = new Html5Qrcode('tmpReader', { formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE], verbose: false });
+    const text = await tmp.scanFile(f, false);
+    try { tmp.clear(); } catch (e) {}
+    lastCode = ''; busy = false; // ảnh chụp là thao tác chủ động nên không chặn trùng 5 giây
+    onScan(text);
+  } catch (e) {
+    beep(false);
+    show('err', '⚠️ Không đọc được QR trong ảnh', ['Chụp lại: QR nằm giữa khung, gần hơn, đủ sáng, không rung.']);
+  }
+  ev.target.value = '';
+};
+
+function onScan(text) {
+  const now = Date.now();
+  if (busy) return;                                   // đang xử lý 1 mã
+  if (text === lastCode && now - lastAt < 5000) return; // cùng mã trong 5 giây -> bỏ qua
+  lastCode = text; lastAt = now;
+  show('wait', '⏳ Đang kiểm tra…', [text]);
+  send({ code: text, method: 'QR' });
+}
+
+function send(payload) {
+  payload.staff = session.staff;
+  payload.pin = session.pin;
+  payload.dryRun = $('dry').checked;
+  busy = true;
+  google.script.run
+    .withSuccessHandler(r => { handle(r); setTimeout(() => { busy = false; }, 1200); })
+    .withFailureHandler(e => {
+      beep(false);
+      show('err', '⚠️ LỖI MẠNG / HỆ THỐNG', ['Chưa chắc đã ghi nhận. Quét lại sau vài giây:', 'nếu báo "ĐÃ CHECK-IN" bởi chính bạn thì vé đó đã được ghi.', e.message]);
+      lastCode = '';
+      setTimeout(() => { busy = false; }, 1500);
+    })
+    .apiCheckin(payload);
+}
+
+function handle(r) {
+  if (r.stats) updateStats(r.stats);
+  switch (r.status) {
+    case 'OK':
+      beep(true);
+      show('ok', '✅ HỢP LỆ', [r.name, r.company, 'Vé: ' + r.ticketId, r.time]); break;
+    case 'DUPLICATE':
+      beep(false);
+      show('dup', '⛔ ĐÃ CHECK-IN RỒI', [r.name, r.company, 'Lúc ' + r.firstTime + ' bởi ' + r.firstBy]); break;
+    case 'INVALID':
+      beep(false);
+      show('inv', '❌ VÉ KHÔNG HỢP LỆ', [r.message || '', r.code || '']); break;
+    case 'DRYRUN':
+      beep(true);
+      show('test', '🧪 THỬ QUÉT: ĐỌC ĐƯỢC', [r.name, r.company, 'Vé: ' + r.ticketId, r.already ? 'Trạng thái: ĐÃ check-in' : 'Trạng thái: chưa check-in']); break;
+    case 'AUTH':
+      beep(false); show('err', '🔒 Sai PIN', ['Tải lại trang và đăng nhập lại']); break;
+    default:
+      beep(false); show('err', '⚠️ ' + (r.message || 'Lỗi'), []);
+  }
+}
+
+function show(cls, title, lines) {
+  const el = $('result');
+  el.className = cls; el.textContent = '';
+  const h = document.createElement('div'); h.className = 't'; h.textContent = title; el.appendChild(h);
+  (lines || []).forEach(l => { if (!l) return; const d = document.createElement('div'); d.textContent = l; el.appendChild(d); });
+}
+
+function updateStats(s) { if (s) $('stats').textContent = 'Đã vào: ' + s.checked + '/' + s.total; }
+function refreshStats() {
+  google.script.run.withSuccessHandler(r => { if (r && r.stats) updateStats(r.stats); }).apiStats({ pin: session.pin });
+}
+
+/* Tìm thủ công */
+$('btnSearch').onclick = () => {
+  const q = $('q').value.trim();
+  if (!q) return;
+  google.script.run.withSuccessHandler(renderList).withFailureHandler(e => alert(e.message))
+    .apiSearch({ pin: session.pin, q: q });
+};
+function renderList(rows) {
+  const box = $('list'); box.textContent = '';
+  if (!rows.length) { box.textContent = 'Không tìm thấy'; return; }
+  rows.forEach(r => {
+    const d = document.createElement('div'); d.className = 'row';
+    const t = document.createElement('span'); t.textContent = r.name + ' — ' + r.company + ' (' + r.id + ')' + (r.checked ? ' ✔' : '');
+    const b = document.createElement('button'); b.textContent = r.checked ? 'Xem' : 'Check-in';
+    b.onclick = () => {
+      if (!r.checked && !$('dry').checked && !confirm('Check-in thủ công cho ' + r.name + '? (hãy đối chiếu giấy tờ)')) return;
+      send({ code: r.id, method: 'MANUAL' });
+      window.scrollTo(0, 0);
+    };
+    d.appendChild(t); d.appendChild(b); box.appendChild(d);
+  });
+}
+
+function beep(ok) {
+  try {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine'; o.frequency.value = ok ? 880 : 220; g.gain.value = 0.15;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + (ok ? 0.15 : 0.5));
+  } catch (e) {}
+  try { if (navigator.vibrate) navigator.vibrate(ok ? 80 : [200, 100, 200]); } catch (e) {}
+}
+</script>
+</body>
+</html>
